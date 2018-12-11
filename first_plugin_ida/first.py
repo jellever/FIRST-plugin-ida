@@ -62,6 +62,7 @@ import calendar
 import threading
 import collections
 import ConfigParser
+from pprint import pprint
 from os.path import exists
 from hashlib import sha256, md5, sha1
 from base64 import b64encode, b64decode
@@ -82,15 +83,24 @@ class IDAWrapper(object):
     '''
     Class to wrap functions that are not thread safe
     '''
+    mapping = {
+        'get_tform_type' : 'get_widget_type',
+    }
+    def __init__(self):
+        self.version = idaapi.IDA_SDK_VERSION
+
     def __getattribute__(self, name):
         default = '[1st] default'
 
+        if (idaapi.IDA_SDK_VERSION >= 700) and (name in IDAWrapper.mapping):
+            name = IDAWrapper.mapping[name]
+
         val = getattr(idaapi, name, default)
         if val == default:
-            val = getattr(idc, name, default)
+            val = getattr(idautils, name, default)
 
         if val == default:
-            val = getattr(idautils, name, default)
+            val = getattr(idc, name, default)
 
         if val == default:
             msg = 'Unable to find {}'.format(name)
@@ -220,19 +230,22 @@ class FIRST_FormClass(idaapi.PluginForm):
 
         #   Add chunks to the list at a time receieved
         self.__received_data = False
-        idaapi.show_wait_box('Querying FIRST for metadata you\'ve created')
-        server_thread = FIRST.server.created(self.__data_callback, self.__complete_callback)
-        #   Spawn thread to get chunks of data back from server
-        self.thread_stop = False
+        if FIRST.server:
+            #   Spawn thread to get chunks of data back from server
+            self.thread_stop = False
+            idaapi.show_wait_box('Querying FIRST for metadata you\'ve created')
+            server_thread = FIRST.server.created(self.__data_callback,
+                                                    self.__complete_callback)
 
-        #   wait several seconds
-        for i in xrange(3):
-            time.sleep(1)
-            if idaapi.wasBreak():
-                self.thread_stop = True
-                FIRST.server.stop_operation(server_thread)
+            #   wait several seconds
+            for i in xrange(2):
+                time.sleep(1)
+                if idaapi.wasBreak():
+                    self.thread_stop = True
+                    FIRST.server.stop_operation(server_thread)
 
-        idaapi.hide_wait_box()
+            idaapi.hide_wait_box()
+
 
         self.history_dialogs = []
         tree_view.setContextMenuPolicy(Qt.ActionsContextMenu)
@@ -593,12 +606,14 @@ class FIRST_FormClass(idaapi.PluginForm):
         dialog.show()
 
 class FIRST(object):
+    debug = False
+
     #   About Information
     #------------------------
     VERSION = 'BETA'
-    DATE = 'November 2016'
+    DATE = 'May 2018'
     BEGIN = 2014
-    END = 2016
+    END = 2018
 
     plugin_enabled = False
     show_welcome = False
@@ -626,15 +641,6 @@ class FIRST(object):
         FIRST.installed_hooks = [FIRST.Hook.IDP(), FIRST.Hook.UI()]
         [x.hook() for x in FIRST.installed_hooks]
         FIRST.plugin = FIRST_FormClass()
-
-        #   populate iat
-        func = lambda ea, name, ord: FIRST.iat.append(name) == None
-        imports = IDAW.get_import_module_qty()
-        if not imports:
-            return
-
-        for i in xrange(imports):
-            IDAW.enum_import_names(i, func)
 
     @staticmethod
     def cleanup_hooks():
@@ -824,10 +830,13 @@ class FIRST(object):
                 list: Empty list or list of `MetadataShim` objects
             '''
             applied_metadata = []
-            for segment in FIRST.Metadata.get_segments_with_functions():
-                for function in FIRST.Metadata.get_segment_functions(segment):
-                    if function.id:
-                        applied_metadata.append(function)
+            segments = FIRST.Metadata.get_segments_with_functions()
+            if segments:
+                for segment in segments:
+                    functions = FIRST.Metadata.get_segment_functions(segment)
+                    for function in functions:
+                        if function.id:
+                            applied_metadata.append(function)
 
             return applied_metadata
 
@@ -848,6 +857,39 @@ class FIRST(object):
         '''
         processor_map = {'metapc' : 'intel'}
         include_bits = ['intel', 'arm']
+
+        @staticmethod
+        def set_file_details(md5, crc32, sha1=None, sha256=None):
+            '''Sets details about the sample.
+
+            This is a work around for situations where there is no original
+            sample on disk that IDA analyzes. FIRST requires a MD5 and CRC32 to
+            store functions, without it the function will not be saved.
+
+            Args:
+                md5 (:obj:`str`): Valid MD5 hash
+            '''
+            #   Validate User Input
+            md5 = md5.lower()
+            if not re.match(r'^[a-f\d]{32}$', md5) or type(crc32) != int:
+                return
+
+            db = IDAW.GetArrayId(FIRST_DB)
+            key = FIRST_INDEX['hashes']
+            if -1 == db:
+                db = IDAW.CreateArray(FIRST_DB)
+
+            #   Get hashes from file
+            data = {'md5' : md5,
+                    'sha1' : sha1,
+                    'sha256' : sha256,
+                    'crc32' : crc32}
+            IDAW.SetArrayString(db, key, json.dumps(data))
+
+            #   Update server class
+            if FIRST.server and hasattr(FIRST.server, 'binary_info'):
+                FIRST.server = FIRST.Server(FIRST.config, md5, crc32, sha1, sha256)
+
 
         @staticmethod
         def get_file_details():
@@ -990,6 +1032,13 @@ class FIRST(object):
                 list: Empty list or list of `MetadataShim` objects
             '''
             apis = []
+            #   populate iat
+            if not FIRST.iat:
+                func = lambda ea, name, ord: FIRST.iat.append(name) == None
+                imports = IDAW.get_import_module_qty()
+                if imports:
+                    for i in xrange(imports):
+                        IDAW.enum_import_names(i, func)
 
             #   Cycle through all instructions within the function
             for instr in IDAW.FuncItems(address):
@@ -1680,9 +1729,9 @@ class FIRST(object):
             config (:obj:`RawConfigParser`): Configuration details for plugin.
         '''
         def __init__(self, config=None):
-            self.__server = 'first-plugin.us'
-            self.__port = 5000
-            self.__protocol = 'https'
+            self.__server = 'first.talosintelligence.com'
+            self.__port = 80
+            self.__protocol = 'http'
             self.__verify = False
             self.__auth = False
             self.__api_key = ''
@@ -1954,8 +2003,6 @@ class FIRST(object):
             for key in params:
                 if params[key] is None:
                     params[key] = ''
-            #idaapi.execute_ui_requests((FIRSTUI.Requests.Print('[POST] Sending: '),))
-            #pprint(params)
 
             authentication = None
             if self.auth:
@@ -1966,6 +2013,13 @@ class FIRST(object):
                 authentication = HTTPKerberosAuth()
 
             url = self.urn.format(self, self.paths[action])
+            if FIRST.debug:
+                idaapi.execute_ui_requests(
+                    (FIRSTUI.Requests.Print(
+                        '[POST] {}\nSending: '.format(url.format(self._user()))),)
+                )
+                pprint(params)
+
             try:
                 response = requests.post(url.format(self._user()),
                                             data=params,
@@ -1989,6 +2043,11 @@ class FIRST(object):
                 idaapi.execute_ui_requests((FIRSTUI.Requests.MsgBox(title, msg),))
                 return
 
+            if FIRST.debug:
+                print response
+                if 'content' in dir(response):
+                    print response.content
+
             if 'status_code' not in dir(response):
                 return None
             elif 200 != response.status_code:
@@ -2002,8 +2061,9 @@ class FIRST(object):
             #    pass
 
             response = self.to_json(response)
-            #idaapi.execute_ui_requests((FIRSTUI.Requests.Print('Server Response:'),))
-            #pprint(response)
+            if FIRST.debug:
+                idaapi.execute_ui_requests((FIRSTUI.Requests.Print('Server Response:'),))
+                pprint(response)
 
             return response
 
@@ -2226,9 +2286,6 @@ class FIRST(object):
             if (isinstance(metadata, FIRST.MetadataShim)
                 or isinstance(metadata, FIRST.MetadataServer)):
                 metadata = metadata.id
-
-            elif not re.match('^[\da-f]{25}$', metadata):
-                return None
 
             try:
                 response = self._sendp('history', {'metadata' : json.dumps([metadata])})
@@ -3121,16 +3178,20 @@ class FIRST(object):
 
             def __data(self, thread, data):
                 if ('failed' in data) and data['failed']:
+                    idaapi.hide_wait_box()
                     if 'msg' not in data:
                         return
 
                     msg = '[1st] Error: {}'.format(data['msg'])
-                    idaapi.execute_ui_requests((FIRSTUI.Requests.Print(msg),))
+                    print msg
+                    #idaapi.execute_ui_requests((FIRSTUI.Requests.Print(msg),))
                     return
 
                 if ('results' not in data):
+                    idaapi.hide_wait_box()
                     msg = '[1st] Error: no results returned'
-                    idaapi.execute_ui_requests((FIRSTUI.Requests.Print(msg),))
+                    print msg
+                    #idaapi.execute_ui_requests((FIRSTUI.Requests.Print(msg),))
                     return
 
                 results = data['results']
@@ -3346,14 +3407,7 @@ class FIRST(object):
             def __init__(self):
                 super(FIRST.Hook.IDP, self).__init__()
 
-            def auto_queue_empty(self, arg):
-                '''Called function for signaling queue status changes.
-
-                The function will populate FIRST's in memory function list, get
-                the required file details, read in FIRST's configuration and
-                set up the FIRST server connection. After initialization the
-                hook removes itself from the IDP hook queue.
-                '''
+            def on_auto_queue_empty(self, arg):
                 if (arg == 200) and (not FIRST.Hook.IDP.executed):
                     FIRST.Hook.IDP.executed = True
                     self.unhook()
@@ -3385,8 +3439,14 @@ class FIRST(object):
 
                         FIRST.plugin_enabled = True
 
-                return super(self.__class__, self).auto_queue_empty(arg)
-
+            if idaapi.get_kernel_version().startswith("7"):
+                def ev_auto_queue_empty(self, arg):
+                    self.on_auto_queue_empty(arg)
+                    return super(self.__class__, self).ev_auto_queue_empty(arg)
+            else:
+                def auto_queue_empty(self, arg):
+                    self.on_auto_queue_empty(arg)
+                    return super(self.__class__, self).auto_queue_empty(arg)
 
         class UI(idaapi.UI_Hooks):
             '''FIRST's UI Hook. Sets UI change hooks and right click menu.'''
@@ -4704,7 +4764,7 @@ class FIRSTUI(object):
             if not utc_str:
                 return None
 
-            utc_dt = datetime.datetime.strptime(utc_str, '%Y-%m-%dT%H:%M:%S.%f')
+            utc_dt = datetime.datetime.strptime(utc_str[:26], '%Y-%m-%dT%H:%M:%S.%f')
             timestamp = calendar.timegm(utc_dt.timetuple())
             local = datetime.datetime.fromtimestamp(timestamp)
             return local.replace(microsecond=utc_dt.microsecond)
